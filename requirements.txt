@@ -1,0 +1,11 @@
+datasetsforecast==0.0.8
+fire
+neuralforecast==0.1.0
+pandas<2
+plotly
+python-dotenv
+pytorch-lightning==1.6.5.post0
+statsforecast
+streamlit
+streamlit-aggrid
+numpy<2
