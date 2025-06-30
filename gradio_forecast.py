@@ -1,13 +1,11 @@
 import gradio as gr
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from time import time
-import os
+from datasetsforecast.losses import mae, mape, rmse, smape
 
 from src.nf import MODELS, forecast_pretrained_model
 from src.model_descriptions import model_cards
-from datasetsforecast.losses import mae, mape, rmse, smape
 
 DATASETS = {
     "Electricity (Ercot COAST)": "https://raw.githubusercontent.com/Nixtla/transfer-learning-time-series/main/datasets/ercot_COAST.csv",
@@ -54,7 +52,6 @@ def plot(df, uid, df_forecast, model):
                 name=f"Forecast {uid}",
             ),
         ])
-
     fig = go.Figure(figs)
     fig.update_layout(
         plot_bgcolor="rgba(0, 0, 0, 0)",
@@ -68,34 +65,20 @@ def plot(df, uid, df_forecast, model):
         initial_range = [df.tail(200)["ds"].iloc[0], ds_f[-1]]
         fig["layout"]["xaxis"].update(range=initial_range)
     return fig
-
 def run_forecast(data_selection, url_input, uploaded_file, timestamp_col, value_col, model_name, fh, max_steps, cv_windows):
-
-    # Determine the data source
-    df = None
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file.name)
-        # Ensure timestamp_col and value_col are not None before renaming
-        if timestamp_col and value_col:
-            df = df.rename(columns={timestamp_col: "ds", value_col: "y"})
-        else:
-            # Handle case where columns are not selected
-            # You might want to return an error message here
-            return go.Figure(), pd.DataFrame(), pd.DataFrame(), "Error: Please select timestamp and value columns for the uploaded file.", None, go.Figure(), pd.DataFrame()
-
+        df = df.rename(columns={timestamp_col: "ds", value_col: "y"})
     elif url_input:
         df = pd.read_csv(url_input)
-        # For URL, assume the first two columns are the correct ones if not named ds/y
         if "ds" not in df.columns or "y" not in df.columns:
             df = df.rename(columns={df.columns[0]: "ds", df.columns[1]: "y"})
-    
     else:
         df = pd.read_csv(DATASETS[data_selection])
         if "timestamp" in df.columns and "value" in df.columns:
             df = df.rename(columns={"timestamp": "ds", "value": "y"})
         elif "ds" not in df.columns or "y" not in df.columns:
             df = df.rename(columns={df.columns[0]: "ds", df.columns[1]: "y"})
-
 
     if "unique_id" not in df.columns:
         df.insert(0, "unique_id", "ts_0")
@@ -106,7 +89,6 @@ def run_forecast(data_selection, url_input, uploaded_file, timestamp_col, value_
     uid = df["unique_id"].unique()[0]
     model_file = MODELS[model_name]["model"]
 
-    # ---- Forecast Tab Logic ----
     init = time()
     df_forecast = forecast_pretrained_model(df, model_file, fh, max_steps)
     end = time()
@@ -115,20 +97,19 @@ def run_forecast(data_selection, url_input, uploaded_file, timestamp_col, value_
     forecast_plot = plot(df.query("unique_id == @uid"), uid, df_forecast.query("unique_id == @uid"), model_name)
     inference_time_message = f'Done! Approximate inference time CPU: {0.7*(end-init):.2f} seconds.'
 
-    # Save forecast to a temporary file for download
     forecast_filepath = "forecasts.csv"
     df_forecast.to_csv(forecast_filepath, index=False)
 
-    # ---- Cross Validation Tab Logic ----
+    # Cross-validation
     df_cv_forecast_list = []
     for i_window in range(cv_windows, 0, -1):
         test = df.groupby("unique_id").tail(i_window * fh)
         train = df.drop(test.index)
         if not train.empty:
-            df_forecast_w = forecast_pretrained_model(train, model_file, fh, max_steps)
-            df_forecast_w = df_forecast_w.rename(columns={"y_5": "forecast_lo_90", "y_50": "forecast", "y_95": "forecast_hi_90"})
-            df_forecast_w.insert(2, "window", i_window)
-            df_cv_forecast_list.append(df_forecast_w)
+            df_fcst = forecast_pretrained_model(train, model_file, fh, max_steps)
+            df_fcst = df_fcst.rename(columns={"y_5": "forecast_lo_90", "y_50": "forecast", "y_95": "forecast_hi_90"})
+            df_fcst.insert(2, "window", i_window)
+            df_cv_forecast_list.append(df_fcst)
 
     if df_cv_forecast_list:
         df_cv_forecast = pd.concat(df_cv_forecast_list)
@@ -137,27 +118,27 @@ def run_forecast(data_selection, url_input, uploaded_file, timestamp_col, value_
 
         metrics = [mae, mape, rmse, smape]
         evaluation = df_cv_forecast.groupby(["unique_id", "window"]).apply(
-            lambda x: [f'{fn(x["y"].values, x["forecast"].values):.2f}' for fn in metrics] if x['y'].notna().all() else ['N/A'] * len(metrics)
-        )
-        evaluation = evaluation.rename("eval").reset_index()
-        evaluation["eval"] = evaluation["eval"].str.join(",")
-        evaluation[["MAE", "MAPE", "RMSE", "sMAPE"]] = evaluation["eval"].str.split(",", expand=True)
+            lambda x: pd.Series([
+                round(mae(x['y'].values, x['forecast'].values), 2),
+                round(mape(x['y'].values, x['forecast'].values), 2),
+                round(rmse(x['y'].values, x['forecast'].values), 2),
+                round(smape(x['y'].values, x['forecast'].values), 2),
+            ], index=["MAE", "MAPE", "RMSE", "sMAPE"])
+        ).reset_index()
 
         cv_plot = plot(df.query("unique_id == @uid"), uid, df_cv_forecast.query("unique_id == @uid"), model_name)
-        cv_metrics_df = evaluation.query("unique_id == @uid").drop(columns=["unique_id", "eval"]).set_index("window")
+        cv_metrics_df = evaluation.query("unique_id == @uid").set_index("window")
     else:
-        cv_plot = go.Figure() # Empty plot
-        cv_metrics_df = pd.DataFrame() # Empty dataframe
+        cv_plot = go.Figure()
+        cv_metrics_df = pd.DataFrame()
 
     return forecast_plot, df, df_forecast, inference_time_message, forecast_filepath, cv_plot, cv_metrics_df
-
-# --- New function to update dropdowns ---
+    
 def update_column_dropdowns(file):
     if file is not None:
         try:
-            df = pd.read_csv(file.name, nrows=1) # Read only header to be fast
+            df = pd.read_csv(file.name, nrows=1)
             columns = df.columns.tolist()
-            # Intelligently guess default values
             ts_guess = next((col for col in ['ds', 'timestamp', 'date'] if col in columns), columns[0] if columns else None)
             val_guess = next((col for col in ['y', 'value', 'values'] if col in columns), columns[1] if len(columns) > 1 else None)
             return gr.Dropdown(choices=columns, value=ts_guess, interactive=True), gr.Dropdown(choices=columns, value=val_guess, interactive=True)
@@ -165,7 +146,6 @@ def update_column_dropdowns(file):
             print(f"Error reading CSV to get columns: {e}")
             return gr.Dropdown(choices=[], interactive=False), gr.Dropdown(choices=[], interactive=False)
     return gr.Dropdown(choices=[], interactive=False), gr.Dropdown(choices=[], interactive=False)
-
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("# Transfer Learning: Revolutionizing Time Series by Nixtla")
@@ -184,17 +164,14 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                 url_input = gr.Textbox(label="Or provide your own URL to a CSV file")
                 uploaded_file = gr.File(label="Or upload a CSV file")
                 gr.Markdown("For uploaded files, specify the column names below.")
-                # --- Changed from Textbox to Dropdown ---
                 timestamp_col_dd = gr.Dropdown(label="Timestamp column", interactive=False)
                 value_col_dd = gr.Dropdown(label="Value column", interactive=False)
-
             with gr.Column():
                 model_name = gr.Dropdown(label="Select your model", choices=list(MODELS.keys()), value="Pretrained N-HiTS M4 Hourly")
                 fh = gr.Slider(label="Forecast horizon", minimum=1, maximum=100, value=18, step=1)
                 max_steps = gr.Slider(label="N-shot inference (fine-tuning steps)", minimum=0, maximum=100, value=0, step=1)
                 submit_btn = gr.Button("Submit")
 
-    # --- New event handler for file upload ---
     uploaded_file.upload(
         fn=update_column_dropdowns,
         inputs=[uploaded_file],
@@ -218,7 +195,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             with gr.Row():
                 with gr.Column(scale=1):
                     cv_windows = gr.Slider(label="Cross validation windows", minimum=1, maximum=10, value=1, step=1)
-                    gr.Markdown("### Evaluation Metrics")
+                    gr.Markdown("### Evaluation Metrics\n- **MAE**: Mean Absolute Error\n- **MAPE**: Mean Absolute Percentage Error\n- **RMSE**: Root Mean Squared Error\n- **sMAPE**: Symmetric Mean Absolute Percentage Error")
                     cv_metrics_display = gr.Dataframe(interactive=False)
                 with gr.Column(scale=2):
                     cv_plot_display = gr.Plot()
@@ -227,47 +204,43 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             with gr.Tabs():
                 with gr.TabItem("🚀 Transfer Learning"):
                     gr.Markdown("""
-                        ...
-                        """)
+                    Transfer learning refers to the process of pre-training a flexible model on a large dataset and using it later on other data with little to no training. It is one of the most outstanding 🚀 achievements in Machine Learning 🧠 and has many practical applications.
+
+                    For time series forecasting, the technique allows you to get lightning-fast predictions ⚡ bypassing the tradeoff between accuracy and speed.
+
+                    [This notebook](https://colab.research.google.com/drive/1uFCO2UBpH-5l2fk3KmxfU0oupsOC6v2n?authuser=0&pli=1#cell-5=) shows how to generate a pre-trained model and store it in a checkpoint to make it available for public use to forecast new time series never seen by the model.  
+                    **You can contribute with your pre-trained models by following [this Notebook](https://github.com/Nixtla/transfer-learning-time-series/blob/main/nbs/Transfer_Learning.ipynb) and sending us an email at federico[at]nixtla.io**
+
+                    You can also take a look at list of pretrained models here. Currently we have these available in our [API](https://docs.nixtla.io/reference/neural_transfer_neural_transfer_post) or [Demo](http://nixtla.io/transfer-learning/). You can also download the `.ckpt`:
+                    - [Pretrained N-HiTS M4 Hourly](https://nixtla-public.s3.amazonaws.com/transfer/pretrained_models/nhits_m4_hourly.ckpt)
+                    - [Pretrained N-BEATS M4 Daily](https://nixtla-public.s3.amazonaws.com/transfer/pretrained_models/nbeats_m4_daily.ckpt)
+                    ... and more.
+                    """)
+
                 with gr.TabItem("🔎 Description of the model"):
                     model_card_selection = gr.Dropdown(label="Select a model to see its description", choices=list(model_cards.keys()), value="nhitsh")
                     model_card_display = gr.Markdown()
 
                     def update_model_card(selection):
                         card = model_cards.get(selection, {})
-                        return f"""
-                        ### Abstract
-                        {card.get('Abstract', 'N/A')}
-                        ### Intended use
-                        {card.get('Intended use', 'N/A')}
-                        ### Limitations
-                        {card.get('Limitations', 'N/A')}
-                        ### Training data
-                        {card.get('Training data', 'N/A')}
-                        ### Citation Info
-                        ```
-                        {card.get('Citation Info', 'N/A')}
-                        ```
-                        """
+                        return f"### Abstract\n{card.get('Abstract', 'N/A')}\n\n### Intended use\n{card.get('Intended use', 'N/A')}\n\n### Limitations\n{card.get('Limitations', 'N/A')}\n\n### Training data\n{card.get('Training data', 'N/A')}\n\n### Citation Info\n```\n{card.get('Citation Info', 'N/A')}\n```"
+
                     model_card_selection.change(fn=update_model_card, inputs=model_card_selection, outputs=model_card_display)
                     demo.load(fn=update_model_card, inputs=model_card_selection, outputs=model_card_display)
 
                 with gr.TabItem("📚 References"):
-                    gr.Markdown("""
-                        ...
-                        """)
+                    gr.Markdown("If you are interested in the transfer learning literature applied to time series forecasting, take a look at these papers:\n- [Meta-learning framework with applications to zero-shot time-series forecasting](https://arxiv.org/abs/2002.02887)\n- [N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting](https://arxiv.org/abs/2201.12886)")
+
 
         with gr.TabItem("🔮 Nixtlaverse"):
-            gr.Markdown("""
-                ...
-                """)
+            gr.Markdown("Nixtla is a startup that is building forecasting software for Data Scientists and Devs.\n\nWe have been developing different open source libraries for machine learning, statistical and deep learning forecasting.\n\nIn our [GitHub repo](https://github.com/Nixtla), you can find the projects that support this APP.")
+
             gr.Image("https://files.readme.io/168cdb2-Screen_Shot_2022-09-30_at_10.40.09.png", width=800)
 
-    submit_btn.click(
-        fn=run_forecast,
-        inputs=[data_selection, url_input, uploaded_file, timestamp_col_dd, value_col_dd, model_name, fh, max_steps, cv_windows],
-        outputs=[forecast_plot_display, input_df_display, forecast_df_display, inference_time_display, forecast_download_btn, cv_plot_display, cv_metrics_display]
-    )
+    submit_btn.click(fn=run_forecast, inputs=[data_selection, url_input, uploaded_file, timestamp_col_dd, value_col_dd, model_name, fh, max_steps, cv_windows],
+                     outputs=[forecast_plot_display, input_df_display, forecast_df_display, inference_time_display, forecast_download_btn, cv_plot_display, cv_metrics_display])
+    cv_windows.change(fn=run_forecast, inputs=[data_selection, url_input, uploaded_file, timestamp_col_dd, value_col_dd, model_name, fh, max_steps, cv_windows],
+                      outputs=[forecast_plot_display, input_df_display, forecast_df_display, inference_time_display, forecast_download_btn, cv_plot_display, cv_metrics_display])
 
 if __name__ == "__main__":
     demo.launch(share=True)
